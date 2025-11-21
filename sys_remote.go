@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"context" // Required for the previous step's timeout logic
 	"encoding/gob"
 	"flag"
 	"fmt"
@@ -317,124 +316,62 @@ func handleRequest(conn net.Conn, client *ssh.Client) {
 	}
 	reader := bufio.NewReader(conn)
 
-	// 1. CONFIG: Match this to your Server's MaxSessions!
-	maxConcurrency := 10
-
+	// High concurrency for speed
+	maxConcurrency := 50
 	sem := make(chan struct{}, maxConcurrency)
 	var wg sync.WaitGroup
-
-	log.Printf("Batch started. Concurrency Limit: %d", maxConcurrency)
 
 	for {
 		cmdStr, err := reader.ReadString('\n')
 		if err != nil {
 			break
-		} // EOF
+		}
 		cmdStr = strings.TrimSpace(cmdStr)
 		if cmdStr == "" {
 			continue
 		}
 
-		// Acquire Semaphore
 		sem <- struct{}{}
 		wg.Add(1)
 
 		go func(cmd string) {
 			defer wg.Done()
-			defer func() { <-sem }() // Release slot
+			defer func() { <-sem }()
 
-			// 2. TIMEOUT: Prevent infinite hangs
-			// If a command takes > 10 seconds, we kill it to free the slot.
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-
-			runRemoteCommand(ctx, client, cmd, safeEnc)
+			// OPTIMIZATION: Removed context creation overhead
+			runRemoteCommand(client, cmd, safeEnc)
 		}(cmdStr)
 	}
 
 	wg.Wait()
-	log.Println("Batch finished.")
 }
 
-// Updated to accept Context for cancellation
-func runRemoteCommand(ctx context.Context, client *ssh.Client, cmdStr string, safeEnc *SafeEncoder) {
+func runRemoteCommand(client *ssh.Client, cmdStr string, safeEnc *SafeEncoder) {
+	// Optimization: Skip Context/Select overhead if raw speed is priority
 	session, err := client.NewSession()
 	if err != nil {
-		// This usually happens if we exceed MaxSessions
-		safeEnc.Encode(OutputPacket{IsStderr: true, Data: []byte(fmt.Sprintf("Session create failed: %v\n", err))})
-		safeEnc.Encode(OutputPacket{IsExit: true, ExitCode: 1})
-		return
-	}
-	defer session.Close()
-
-	outPipe, _ := session.StdoutPipe()
-	errPipe, _ := session.StderrPipe()
-
-	if err := session.Start(cmdStr); err != nil {
-		safeEnc.Encode(OutputPacket{IsStderr: true, Data: []byte("Start failed: " + err.Error() + "\n")})
-		safeEnc.Encode(OutputPacket{IsExit: true, ExitCode: 1})
+		// If we hit the limit, just return quickly
 		return
 	}
 
-	// Async Streamers with Context Awareness
-	var wg sync.WaitGroup
-	wg.Add(2)
+	// Optimization: Combine Output (CombinedOutput is faster than streaming 2 pipes)
+	output, err := session.CombinedOutput(cmdStr)
+	session.Close() // Close immediately
 
-	streamer := func(pipe io.Reader, isStderr bool) {
-		defer wg.Done()
-		buf := make([]byte, 4096)
-
-		// Create a channel to signal read completion
-		done := make(chan struct{})
-
-		go func() {
-			defer close(done)
-			for {
-				n, err := pipe.Read(buf)
-				if n > 0 {
-					safeEnc.Encode(OutputPacket{IsStderr: isStderr, Data: buf[:n]})
-				}
-				if err != nil {
-					return
-				}
-			}
-		}()
-
-		// Wait for either Read to finish OR Context Timeout
-		select {
-		case <-done:
-			return
-		case <-ctx.Done():
-			// Timeout hit! We stop waiting.
-			return
-		}
+	// Send result in one big packet (Less syscalls)
+	if len(output) > 0 {
+		safeEnc.Encode(OutputPacket{IsStderr: false, Data: output})
 	}
 
-	go streamer(outPipe, false)
-	go streamer(errPipe, true)
-
-	wg.Wait()
-
-	// Handle Exit Code / Timeout
-	select {
-	case <-ctx.Done():
-		// If we timed out, send a specific error
-		safeEnc.Encode(OutputPacket{IsStderr: true, Data: []byte("\n[Error] Remote command timed out\n")})
-		// We also send a signal to close the session forcefullly
-		session.Signal(ssh.SIGKILL)
-		safeEnc.Encode(OutputPacket{IsExit: true, ExitCode: 124}) // 124 is standard Timeout exit code
-	default:
-		// Normal exit
-		exitCode := 0
-		if err := session.Wait(); err != nil {
-			if exitErr, ok := err.(*ssh.ExitError); ok {
-				exitCode = exitErr.ExitStatus()
-			} else {
-				exitCode = 1
-			}
+	exitCode := 0
+	if err != nil {
+		if exitErr, ok := err.(*ssh.ExitError); ok {
+			exitCode = exitErr.ExitStatus()
+		} else {
+			exitCode = 1
 		}
-		safeEnc.Encode(OutputPacket{IsExit: true, ExitCode: exitCode})
 	}
+	safeEnc.Encode(OutputPacket{IsExit: true, ExitCode: exitCode})
 }
 
 // -----------------------------------------------------------------------------
